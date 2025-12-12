@@ -1,8 +1,9 @@
 name: Build
 
 on:
+  workflow_dispatch:  # 允许手动触发
   push:
-    branches: [ "main" ]
+    branches: [ "main", "lyjw" ]
   pull_request:
     branches: [ "main" ]
 
