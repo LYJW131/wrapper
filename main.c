@@ -322,6 +322,11 @@ static inline void init() {
 
   // raise(SIGSTOP);
   fprintf(stderr, "[+] starting...\n");
+
+  // Ignore SIGPIPE to prevent process termination when writing to closed
+  // sockets
+  signal(SIGPIPE, SIG_IGN);
+
   setenv("ANDROID_DNS_MODE", "local", 1);
   if (args_info.proxy_given) {
     fprintf(stderr, "[+] Using proxy %s\n", args_info.proxy_arg);
@@ -853,6 +858,9 @@ static inline void *new_socket_m3u8(void *args) {
 
 // ===== Account API Helper Functions =====
 
+// Forward declaration
+static void remove_sse_client(int connfd);
+
 static const char *get_status_string(login_status_t status) {
   switch (status) {
   case STATUS_NEED_LOGIN:
@@ -870,37 +878,67 @@ static const char *get_status_string(login_status_t status) {
   }
 }
 
-static void send_sse_event(int connfd, const char *event_data) {
+static int send_sse_event(int connfd, const char *event_data) {
   char buffer[512];
   snprintf(buffer, sizeof(buffer), "data: %s\n\n", event_data);
-  write(connfd, buffer, strlen(buffer));
+  ssize_t written = write(connfd, buffer, strlen(buffer));
+  if (written < 0) {
+    return -1; // Client disconnected
+  }
+  return 0;
 }
 
 static void broadcast_sse_status(login_status_t status) {
   char event_data[512];
+  char timestamp[32];
+  time_t now = time(NULL);
+  struct tm *tm_info = localtime(&now);
+  strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%S", tm_info);
+
   if (status == STATUS_LOGIN_FAILED && g_login_error[0] != '\0') {
     snprintf(event_data, sizeof(event_data),
-             "{\"status\":\"%s\",\"error\":\"%s\"}", get_status_string(status),
-             g_login_error);
+             "{\"type\":\"status_change\",\"status\":\"%s\",\"error\":\"%s\","
+             "\"timestamp\":\"%s\"}",
+             get_status_string(status), g_login_error, timestamp);
   } else {
-    snprintf(event_data, sizeof(event_data), "{\"status\":\"%s\"}",
-             get_status_string(status));
+    snprintf(
+        event_data, sizeof(event_data),
+        "{\"type\":\"status_change\",\"status\":\"%s\",\"timestamp\":\"%s\"}",
+        get_status_string(status), timestamp);
   }
 
   pthread_mutex_lock(&sse_mutex);
+  int disconnected[MAX_SSE_CLIENTS];
+  int disconnect_count = 0;
+
   for (int i = 0; i < sse_client_count; i++) {
-    send_sse_event(sse_clients[i], event_data);
+    if (send_sse_event(sse_clients[i], event_data) < 0) {
+      disconnected[disconnect_count++] = sse_clients[i];
+    }
   }
   pthread_mutex_unlock(&sse_mutex);
+
+  // Remove disconnected clients
+  for (int i = 0; i < disconnect_count; i++) {
+    remove_sse_client(disconnected[i]);
+    fprintf(stderr, "[SSE] client fd=%d disconnected during broadcast\n",
+            disconnected[i]);
+  }
+
+  fprintf(stderr, "[SSE] broadcast: %s (clients=%d)\n", event_data,
+          sse_client_count);
 }
 
 static void set_login_status(login_status_t status) {
   pthread_mutex_lock(&status_mutex);
+  login_status_t old_status = g_login_status;
   g_login_status = status;
   pthread_mutex_unlock(&status_mutex);
+
+  fprintf(stderr, "[.] login status changed: %s -> %s\n",
+          get_status_string(old_status), get_status_string(status));
+
   broadcast_sse_status(status);
-  fprintf(stderr, "[.] login status changed to: %s\n",
-          get_status_string(status));
 }
 
 static void remove_sse_client(int connfd) {
@@ -1179,24 +1217,47 @@ static void handle_events(int connfd) {
   pthread_mutex_lock(&sse_mutex);
   if (sse_client_count < MAX_SSE_CLIENTS) {
     sse_clients[sse_client_count++] = connfd;
-    fprintf(stderr, "[.] /events: client connected, total=%d\n",
+    fprintf(stderr, "[SSE] client connected (fd=%d, total=%d)\n", connfd,
             sse_client_count);
   } else {
     pthread_mutex_unlock(&sse_mutex);
-    fprintf(stderr, "[!] /events: max clients reached\n");
+    fprintf(stderr, "[SSE] max clients reached, rejecting connection\n");
     return;
   }
   pthread_mutex_unlock(&sse_mutex);
 
-  // Send current status
+  // Send current status with consistent format
   pthread_mutex_lock(&status_mutex);
   login_status_t status = g_login_status;
   pthread_mutex_unlock(&status_mutex);
 
-  char event_data[256];
-  snprintf(event_data, sizeof(event_data), "{\"status\":\"%s\"}",
-           get_status_string(status));
+  char timestamp[32];
+  time_t now = time(NULL);
+  struct tm *tm_info = localtime(&now);
+  strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%S", tm_info);
+
+  char event_data[512];
+  if (status == STATUS_LOGGED_IN && g_storefront_id && g_music_token) {
+    snprintf(event_data, sizeof(event_data),
+             "{\"type\":\"status_change\",\"status\":\"%s\","
+             "\"storefront_id\":\"%s\",\"music_token\":\"%.14s...\","
+             "\"timestamp\":\"%s\"}",
+             get_status_string(status), g_storefront_id ? g_storefront_id : "",
+             g_music_token ? g_music_token : "", timestamp);
+  } else if (status == STATUS_LOGIN_FAILED && g_login_error[0] != '\0') {
+    snprintf(event_data, sizeof(event_data),
+             "{\"type\":\"status_change\",\"status\":\"%s\",\"error\":\"%s\","
+             "\"timestamp\":\"%s\"}",
+             get_status_string(status), g_login_error, timestamp);
+  } else {
+    snprintf(
+        event_data, sizeof(event_data),
+        "{\"type\":\"status_change\",\"status\":\"%s\",\"timestamp\":\"%s\"}",
+        get_status_string(status), timestamp);
+  }
   send_sse_event(connfd, event_data);
+  fprintf(stderr, "[SSE] sent initial status to fd=%d: %s\n", connfd,
+          event_data);
 
   // Keep connection alive until client disconnects
   while (1) {
@@ -1214,7 +1275,7 @@ static void handle_events(int connfd) {
 
   // Remove client
   remove_sse_client(connfd);
-  fprintf(stderr, "[.] /events: client disconnected\n");
+  fprintf(stderr, "[SSE] client disconnected (fd=%d)\n", connfd);
 }
 
 // ===== Main Account Handler =====
