@@ -424,38 +424,6 @@ static inline struct shared_ptr init_ctx() {
   return reqCtx;
 }
 
-extern void *endLeaseCallback;
-extern void *pbErrCallback;
-
-inline static uint8_t login(struct shared_ptr reqCtx) {
-  fprintf(stderr, "[+] logging in...\n");
-  if (file_exists(strcat_b(args_info.base_dir_arg, "/STOREFRONT_ID"))) {
-    remove(strcat_b(args_info.base_dir_arg, "/STOREFRONT_ID"));
-  }
-  if (file_exists(strcat_b(args_info.base_dir_arg, "/MUSIC_TOKEN"))) {
-    remove(strcat_b(args_info.base_dir_arg, "/MUSIC_TOKEN"));
-  }
-  struct shared_ptr flow;
-  _ZNSt6__ndk110shared_ptrIN17storeservicescore16AuthenticateFlowEE11make_sharedIJRNS0_INS1_14RequestContextEEEEEES3_DpOT_(
-      &flow, &reqCtx);
-  _ZN17storeservicescore16AuthenticateFlow3runEv(flow.obj);
-  struct shared_ptr *resp =
-      _ZNK17storeservicescore16AuthenticateFlow8responseEv(flow.obj);
-  if (resp == NULL || resp->obj == NULL)
-    return 0;
-  const int respType =
-      _ZNK17storeservicescore20AuthenticateResponse12responseTypeEv(resp->obj);
-  fprintf(stderr, "[.] response type %d\n", respType);
-  return respType == 6;
-  // struct shared_ptr subStatMgr;
-  // _ZN20androidstoreservices30SVSubscriptionStatusMgrFactory6createEv(&subStatMgr);
-  // struct shared_ptr data;
-  // int method = 2;
-  // _ZN20androidstoreservices27SVSubscriptionStatusMgrImpl33checkSubscriptionStatusFromSourceERKNSt6__ndk110shared_ptrIN17storeservicescore14RequestContextEEERKNS_23SVSubscriptionStatusMgr26SVSubscriptionStatusSourceE(&data,
-  // subStatMgr.obj, &reqCtx, &method);
-  // return 1;
-}
-
 static inline uint8_t readfull(const int connfd, void *const buf,
                                const size_t size) {
   size_t red = 0;
