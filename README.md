@@ -4,6 +4,12 @@ A tool to decrypt Apple Music songs. An active subscription is still needed.
 
 Supports only x86_64 and arm64 Linux.
 
+## Features
+
+- **Concurrent Decryption**: Multi-threaded architecture allows simultaneous handling of multiple decryption requests
+- **Three Service Ports**: Decrypt (10020), M3U8 (20020), Account API (30020)
+- **High Performance**: Each connection is processed in a separate thread for maximum throughput
+
 ## Installation
 
 Installation methods:
