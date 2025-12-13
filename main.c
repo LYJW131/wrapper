@@ -41,8 +41,7 @@ typedef struct {
   int connfd;
 } thread_args_t;
 
-// Mutex for thread-safe operations on shared resources
-static pthread_mutex_t decrypt_mutex = PTHREAD_MUTEX_INITIALIZER;
+// Mutex for thread-safe cache access
 static pthread_mutex_t preshare_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 #ifndef MyRelease
@@ -470,21 +469,18 @@ inline static void *getKdContext(const char *const adam,
 
   struct shared_ptr persistK = {.obj = NULL};
 
-  // Lock for FairPlay library calls (thread safety unknown)
-  pthread_mutex_lock(&decrypt_mutex);
+  // FairPlay library calls - running without lock for maximum parallelism
   _ZN21SVFootHillSessionCtrl16getPersistentKeyERKNSt6__ndk112basic_stringIcNS0_11char_traitsIcEENS0_9allocatorIcEEEES8_S8_S8_S8_S8_S8_S8_(
       &persistK, FHinstance, &defaultId, &defaultId, &keyUri, &keyFormat,
       &keyFormatVer, &serverUri, &protocolType, &fpsCert);
 
   if (persistK.obj == NULL) {
-    pthread_mutex_unlock(&decrypt_mutex);
     return NULL;
   }
 
   struct shared_ptr SVFootHillPContext;
   _ZN21SVFootHillSessionCtrl14decryptContextERKNSt6__ndk112basic_stringIcNS0_11char_traitsIcEENS0_9allocatorIcEEEERKN11SVDecryptor15SVDecryptorTypeERKb(
       &SVFootHillPContext, FHinstance, persistK.obj);
-  pthread_mutex_unlock(&decrypt_mutex);
 
   if (SVFootHillPContext.obj == NULL)
     return NULL;
