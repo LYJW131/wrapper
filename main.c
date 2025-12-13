@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <arpa/inet.h>
@@ -36,6 +37,35 @@ static char *g_storefront_id = NULL;
 static char *g_dev_token = NULL;
 static char *g_music_token = NULL;
 
+// Login status management
+typedef enum {
+  STATUS_NEED_LOGIN,
+  STATUS_LOGGING_IN,
+  STATUS_NEED_2FA,
+  STATUS_LOGGED_IN,
+  STATUS_LOGIN_FAILED
+} login_status_t;
+
+static login_status_t g_login_status = STATUS_NEED_LOGIN;
+static pthread_mutex_t status_mutex = PTHREAD_MUTEX_INITIALIZER;
+static char g_login_error[256] = {0};
+
+// SSE client management
+#define MAX_SSE_CLIENTS 16
+static int sse_clients[MAX_SSE_CLIENTS];
+static int sse_client_count = 0;
+static pthread_mutex_t sse_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// 2FA synchronization
+static char g_2fa_code[8] = {0};
+static int g_2fa_received = 0;
+static pthread_cond_t g_2fa_cond = PTHREAD_COND_INITIALIZER;
+static pthread_mutex_t g_2fa_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// Login credentials (set by API)
+static char g_username[256] = {0};
+static char g_password[256] = {0};
+
 // Thread support for concurrent connections
 typedef struct {
   int connfd;
@@ -43,6 +73,19 @@ typedef struct {
 
 // Mutex for thread-safe cache access
 static pthread_mutex_t preshare_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// Forward declarations for functions used in login_thread_func
+int offline_available(void);
+char *get_account_storefront_id(struct shared_ptr reqCtx);
+char *get_dev_token(struct shared_ptr reqCtx);
+char *get_music_user_token(char *guid, char *authToken,
+                           struct shared_ptr reqCtx);
+char *get_guid(void);
+void write_storefront_id(void);
+void write_music_token(void);
+extern void *endLeaseCallback;
+extern void *pbErrCallback;
+static void *FHinstance;
 
 #ifndef MyRelease
 int32_t CURLOPT_SSL_VERIFYPEER = 64;
@@ -201,6 +244,9 @@ static void dialogHandler(long j, struct shared_ptr *protoDialogPtr,
       apInf.obj, &j, &diagResp);
 }
 
+// Forward declaration for set_login_status
+static void set_login_status(login_status_t status);
+
 static void credentialHandler(struct shared_ptr *credReqHandler,
                               struct shared_ptr *credRespHandler) {
   const uint8_t need2FA =
@@ -216,35 +262,32 @@ static void credentialHandler(struct shared_ptr *credReqHandler,
   int passLen = strlen(amPassword);
 
   if (need2FA) {
-    if (args_info.code_from_file_flag) {
-      fprintf(stderr, "[!] Enter your 2FA code into rootfs/%s/2fa.txt\n",
-              args_info.base_dir_arg);
-      fprintf(stderr,
-              "[!] Example command: echo -n 114514 > rootfs/%s/2fa.txt\n",
-              args_info.base_dir_arg);
-      fprintf(stderr, "[!] Waiting for input...\n");
-      int count = 0;
-      while (1) {
-        if (count >= 20) {
-          fprintf(stderr, "[!] Failed to get 2FA Code in 60s. Exiting...\n");
-          exit(0);
-        }
-        char *path = strcat_b(args_info.base_dir_arg, "/2fa.txt");
-        if (file_exists(path)) {
-          FILE *fp = fopen(path, "r");
-          fscanf(fp, "%6s", amPassword + passLen);
-          remove(path);
-          fprintf(stderr, "[!] Code file detected! Logging in...\n");
-          break;
-        } else {
-          sleep(3);
-          count++;
-        }
+    // API-driven 2FA: signal status and wait for /2fa endpoint
+    set_login_status(STATUS_NEED_2FA);
+    fprintf(stderr, "[!] Waiting for 2FA code via API...\n");
+
+    // Wait for 2FA code with 60 second timeout
+    struct timespec timeout;
+    clock_gettime(CLOCK_REALTIME, &timeout);
+    timeout.tv_sec += 60;
+
+    pthread_mutex_lock(&g_2fa_mutex);
+    while (!g_2fa_received) {
+      int ret = pthread_cond_timedwait(&g_2fa_cond, &g_2fa_mutex, &timeout);
+      if (ret == ETIMEDOUT) {
+        pthread_mutex_unlock(&g_2fa_mutex);
+        fprintf(stderr, "[!] 2FA timeout after 60s\n");
+        snprintf(g_login_error, sizeof(g_login_error), "2FA timeout");
+        set_login_status(STATUS_LOGIN_FAILED);
+        return;
       }
-    } else {
-      printf("2FA code: ");
-      scanf("%6s", amPassword + passLen);
     }
+    // Copy 2FA code to password
+    strncpy(amPassword + passLen, g_2fa_code, 6);
+    amPassword[passLen + 6] = '\0';
+    g_2fa_received = 0;
+    pthread_mutex_unlock(&g_2fa_mutex);
+    fprintf(stderr, "[!] 2FA code received via API, continuing login...\n");
   }
 
   uint8_t *const ptr = malloc(80);
@@ -438,7 +481,6 @@ static inline void writefull(const int connfd, void *const buf,
   }
 }
 
-static void *FHinstance = NULL;
 static void *preshareCtx = NULL;
 
 inline static void *getKdContext(const char *const adam,
@@ -841,6 +883,374 @@ static inline void *new_socket_m3u8(void *args) {
   }
 }
 
+// ===== Account API Helper Functions =====
+
+static const char *get_status_string(login_status_t status) {
+  switch (status) {
+  case STATUS_NEED_LOGIN:
+    return "need_login";
+  case STATUS_LOGGING_IN:
+    return "logging_in";
+  case STATUS_NEED_2FA:
+    return "need_2fa";
+  case STATUS_LOGGED_IN:
+    return "logged_in";
+  case STATUS_LOGIN_FAILED:
+    return "login_failed";
+  default:
+    return "unknown";
+  }
+}
+
+static void send_sse_event(int connfd, const char *event_data) {
+  char buffer[512];
+  snprintf(buffer, sizeof(buffer), "data: %s\n\n", event_data);
+  write(connfd, buffer, strlen(buffer));
+}
+
+static void broadcast_sse_status(login_status_t status) {
+  char event_data[512];
+  if (status == STATUS_LOGIN_FAILED && g_login_error[0] != '\0') {
+    snprintf(event_data, sizeof(event_data),
+             "{\"status\":\"%s\",\"error\":\"%s\"}", get_status_string(status),
+             g_login_error);
+  } else {
+    snprintf(event_data, sizeof(event_data), "{\"status\":\"%s\"}",
+             get_status_string(status));
+  }
+
+  pthread_mutex_lock(&sse_mutex);
+  for (int i = 0; i < sse_client_count; i++) {
+    send_sse_event(sse_clients[i], event_data);
+  }
+  pthread_mutex_unlock(&sse_mutex);
+}
+
+static void set_login_status(login_status_t status) {
+  pthread_mutex_lock(&status_mutex);
+  g_login_status = status;
+  pthread_mutex_unlock(&status_mutex);
+  broadcast_sse_status(status);
+  fprintf(stderr, "[.] login status changed to: %s\n",
+          get_status_string(status));
+}
+
+static void remove_sse_client(int connfd) {
+  pthread_mutex_lock(&sse_mutex);
+  for (int i = 0; i < sse_client_count; i++) {
+    if (sse_clients[i] == connfd) {
+      // Shift remaining clients
+      for (int j = i; j < sse_client_count - 1; j++) {
+        sse_clients[j] = sse_clients[j + 1];
+      }
+      sse_client_count--;
+      break;
+    }
+  }
+  pthread_mutex_unlock(&sse_mutex);
+}
+
+static void send_json_response(int connfd, int status_code,
+                               const char *json_body) {
+  const char *status_text;
+  switch (status_code) {
+  case 200:
+    status_text = "OK";
+    break;
+  case 202:
+    status_text = "Accepted";
+    break;
+  case 400:
+    status_text = "Bad Request";
+    break;
+  case 404:
+    status_text = "Not Found";
+    break;
+  case 500:
+    status_text = "Internal Server Error";
+    break;
+  default:
+    status_text = "Unknown";
+    break;
+  }
+
+  int body_len = strlen(json_body);
+  char headers[512];
+  snprintf(headers, sizeof(headers),
+           "HTTP/1.1 %d %s\r\n"
+           "Content-Type: application/json\r\n"
+           "Content-Length: %d\r\n"
+           "Connection: close\r\n\r\n",
+           status_code, status_text, body_len);
+
+  writefull(connfd, headers, strlen(headers));
+  writefull(connfd, (void *)json_body, body_len);
+}
+
+static void parse_http_request(const char *buffer, char *method, char *path) {
+  sscanf(buffer, "%15s %255s", method, path);
+}
+
+static const char *find_json_body(const char *request) {
+  const char *body = strstr(request, "\r\n\r\n");
+  if (body)
+    return body + 4;
+  return NULL;
+}
+
+// ===== Login Thread Function =====
+
+static void *login_thread_func(void *arg) {
+  set_login_status(STATUS_LOGGING_IN);
+
+  // Set credentials for credentialHandler
+  amUsername = g_username;
+  amPassword = g_password;
+
+  fprintf(stderr, "[+] logging in via API...\n");
+
+  // Delete old tokens
+  if (file_exists(strcat_b(args_info.base_dir_arg, "/STOREFRONT_ID"))) {
+    remove(strcat_b(args_info.base_dir_arg, "/STOREFRONT_ID"));
+  }
+  if (file_exists(strcat_b(args_info.base_dir_arg, "/MUSIC_TOKEN"))) {
+    remove(strcat_b(args_info.base_dir_arg, "/MUSIC_TOKEN"));
+  }
+
+  struct shared_ptr flow;
+  _ZNSt6__ndk110shared_ptrIN17storeservicescore16AuthenticateFlowEE11make_sharedIJRNS0_INS1_14RequestContextEEEEEES3_DpOT_(
+      &flow, &reqCtx);
+  _ZN17storeservicescore16AuthenticateFlow3runEv(flow.obj);
+  struct shared_ptr *resp =
+      _ZNK17storeservicescore16AuthenticateFlow8responseEv(flow.obj);
+
+  if (resp == NULL || resp->obj == NULL) {
+    snprintf(g_login_error, sizeof(g_login_error), "authentication failed");
+    set_login_status(STATUS_LOGIN_FAILED);
+    return NULL;
+  }
+
+  const int respType =
+      _ZNK17storeservicescore20AuthenticateResponse12responseTypeEv(resp->obj);
+  fprintf(stderr, "[.] login response type: %d\n", respType);
+
+  if (respType != 6) {
+    snprintf(g_login_error, sizeof(g_login_error), "login failed with code %d",
+             respType);
+    set_login_status(STATUS_LOGIN_FAILED);
+    return NULL;
+  }
+
+  // Login successful, initialize services
+  _ZN22SVPlaybackLeaseManagerC2ERKNSt6__ndk18functionIFvRKiEEERKNS1_IFvRKNS0_10shared_ptrIN17storeservicescore19StoreErrorConditionEEEEEE(
+      leaseMgr, &endLeaseCallback, &pbErrCallback);
+  uint8_t autom = 1;
+  _ZN22SVPlaybackLeaseManager25refreshLeaseAutomaticallyERKb(leaseMgr, &autom);
+  _ZN22SVPlaybackLeaseManager12requestLeaseERKb(leaseMgr, &autom);
+  FHinstance = _ZN21SVFootHillSessionCtrl8instanceEv();
+
+  offlineFlag = offline_available();
+  if (offlineFlag) {
+    printf("[+] This account supports offline channel\n");
+  }
+
+  // Cache account info
+  g_storefront_id = get_account_storefront_id(reqCtx);
+  g_dev_token = get_dev_token(reqCtx);
+  g_music_token = get_music_user_token(get_guid(), g_dev_token, reqCtx);
+  fprintf(stderr, "[+] account info cached successfully\n");
+
+  write_storefront_id();
+  write_music_token();
+
+  set_login_status(STATUS_LOGGED_IN);
+  return NULL;
+}
+
+// ===== API Endpoint Handlers =====
+
+static void handle_info(int connfd) {
+  pthread_mutex_lock(&status_mutex);
+  login_status_t status = g_login_status;
+  pthread_mutex_unlock(&status_mutex);
+
+  char json_body[1024];
+  if (status == STATUS_LOGGED_IN) {
+    snprintf(json_body, sizeof(json_body),
+             "{\"logged_in\":true,\"storefront_id\":\"%s\","
+             "\"dev_token\":\"%s\",\"music_token\":\"%s\"}",
+             g_storefront_id ? g_storefront_id : "",
+             g_dev_token ? g_dev_token : "",
+             g_music_token ? g_music_token : "");
+  } else {
+    snprintf(json_body, sizeof(json_body),
+             "{\"logged_in\":false,\"status\":\"%s\"}",
+             get_status_string(status));
+  }
+
+  fprintf(stderr, "[.] /info: status=%s\n", get_status_string(status));
+  send_json_response(connfd, 200, json_body);
+}
+
+static void handle_login(int connfd, const char *request) {
+  pthread_mutex_lock(&status_mutex);
+  login_status_t status = g_login_status;
+  pthread_mutex_unlock(&status_mutex);
+
+  if (status == STATUS_LOGGED_IN) {
+    send_json_response(connfd, 400, "{\"error\":\"already logged in\"}");
+    return;
+  }
+  if (status == STATUS_LOGGING_IN || status == STATUS_NEED_2FA) {
+    send_json_response(connfd, 400, "{\"error\":\"login in progress\"}");
+    return;
+  }
+
+  // Parse JSON body
+  const char *body = find_json_body(request);
+  if (!body) {
+    send_json_response(connfd, 400, "{\"error\":\"missing request body\"}");
+    return;
+  }
+
+  cJSON *json = cJSON_Parse(body);
+  if (!json) {
+    send_json_response(connfd, 400, "{\"error\":\"invalid JSON\"}");
+    return;
+  }
+
+  cJSON *username_obj = cJSON_GetObjectItemCaseSensitive(json, "username");
+  cJSON *password_obj = cJSON_GetObjectItemCaseSensitive(json, "password");
+
+  if (!cJSON_IsString(username_obj) || !cJSON_IsString(password_obj)) {
+    cJSON_Delete(json);
+    send_json_response(connfd, 400,
+                       "{\"error\":\"username and password required\"}");
+    return;
+  }
+
+  // Store credentials
+  strncpy(g_username, username_obj->valuestring, sizeof(g_username) - 1);
+  strncpy(g_password, password_obj->valuestring, sizeof(g_password) - 1);
+  cJSON_Delete(json);
+
+  // Reset 2FA state
+  pthread_mutex_lock(&g_2fa_mutex);
+  g_2fa_received = 0;
+  g_2fa_code[0] = '\0';
+  pthread_mutex_unlock(&g_2fa_mutex);
+
+  // Clear login error
+  g_login_error[0] = '\0';
+
+  // Start login thread
+  pthread_t login_thread;
+  if (pthread_create(&login_thread, NULL, login_thread_func, NULL) != 0) {
+    send_json_response(connfd, 500, "{\"error\":\"failed to start login\"}");
+    return;
+  }
+  pthread_detach(login_thread);
+
+  fprintf(stderr, "[.] /login: started login for %s\n", g_username);
+  send_json_response(connfd, 202, "{\"message\":\"login started\"}");
+}
+
+static void handle_2fa(int connfd, const char *request) {
+  pthread_mutex_lock(&status_mutex);
+  login_status_t status = g_login_status;
+  pthread_mutex_unlock(&status_mutex);
+
+  if (status != STATUS_NEED_2FA) {
+    send_json_response(connfd, 400, "{\"error\":\"2fa not required\"}");
+    return;
+  }
+
+  // Parse JSON body
+  const char *body = find_json_body(request);
+  if (!body) {
+    send_json_response(connfd, 400, "{\"error\":\"missing request body\"}");
+    return;
+  }
+
+  cJSON *json = cJSON_Parse(body);
+  if (!json) {
+    send_json_response(connfd, 400, "{\"error\":\"invalid JSON\"}");
+    return;
+  }
+
+  cJSON *code_obj = cJSON_GetObjectItemCaseSensitive(json, "code");
+  if (!cJSON_IsString(code_obj) || strlen(code_obj->valuestring) != 6) {
+    cJSON_Delete(json);
+    send_json_response(connfd, 400, "{\"error\":\"6-digit code required\"}");
+    return;
+  }
+
+  // Set 2FA code and signal waiting thread
+  pthread_mutex_lock(&g_2fa_mutex);
+  strncpy(g_2fa_code, code_obj->valuestring, 6);
+  g_2fa_code[6] = '\0';
+  g_2fa_received = 1;
+  pthread_cond_signal(&g_2fa_cond);
+  pthread_mutex_unlock(&g_2fa_mutex);
+
+  cJSON_Delete(json);
+  fprintf(stderr, "[.] /2fa: code received\n");
+  send_json_response(connfd, 202, "{\"message\":\"2fa code received\"}");
+}
+
+static void handle_events(int connfd) {
+  // Send SSE headers
+  const char *headers = "HTTP/1.1 200 OK\r\n"
+                        "Content-Type: text/event-stream\r\n"
+                        "Cache-Control: no-cache\r\n"
+                        "Connection: keep-alive\r\n"
+                        "Access-Control-Allow-Origin: *\r\n\r\n";
+  write(connfd, headers, strlen(headers));
+
+  // Register client
+  pthread_mutex_lock(&sse_mutex);
+  if (sse_client_count < MAX_SSE_CLIENTS) {
+    sse_clients[sse_client_count++] = connfd;
+    fprintf(stderr, "[.] /events: client connected, total=%d\n",
+            sse_client_count);
+  } else {
+    pthread_mutex_unlock(&sse_mutex);
+    fprintf(stderr, "[!] /events: max clients reached\n");
+    return;
+  }
+  pthread_mutex_unlock(&sse_mutex);
+
+  // Send current status
+  pthread_mutex_lock(&status_mutex);
+  login_status_t status = g_login_status;
+  pthread_mutex_unlock(&status_mutex);
+
+  char event_data[256];
+  snprintf(event_data, sizeof(event_data), "{\"status\":\"%s\"}",
+           get_status_string(status));
+  send_sse_event(connfd, event_data);
+
+  // Keep connection alive until client disconnects
+  while (1) {
+    char buf[1];
+    ssize_t ret = recv(connfd, buf, 1, MSG_PEEK | MSG_DONTWAIT);
+    if (ret == 0) {
+      // Client disconnected
+      break;
+    }
+    if (ret < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+      break;
+    }
+    usleep(500000); // 500ms
+  }
+
+  // Remove client
+  remove_sse_client(connfd);
+  fprintf(stderr, "[.] /events: client disconnected\n");
+}
+
+// ===== Main Account Handler =====
+
 void handle_account(const int connfd) {
   char buffer[4096];
   ssize_t n = read(connfd, buffer, sizeof(buffer) - 1);
@@ -849,60 +1259,24 @@ void handle_account(const int connfd) {
   }
   buffer[n] = '\0';
 
-  // Parse HTTP request (simple check for GET)
-  if (strncmp(buffer, "GET", 3) != 0 && strncmp(buffer, "POST", 4) != 0) {
-    const char *error_response =
-        "HTTP/1.1 400 Bad Request\r\nContent-Type: "
-        "application/json\r\nContent-Length: 0\r\n\r\n";
-    writefull(connfd, (void *)error_response, strlen(error_response));
-    return;
+  char method[16] = {0};
+  char path[256] = {0};
+  parse_http_request(buffer, method, path);
+
+  fprintf(stderr, "[.] account API: %s %s\n", method, path);
+
+  if (strcmp(method, "GET") == 0 && strcmp(path, "/info") == 0) {
+    handle_info(connfd);
+  } else if (strcmp(method, "POST") == 0 && strcmp(path, "/login") == 0) {
+    handle_login(connfd, buffer);
+  } else if (strcmp(method, "POST") == 0 && strcmp(path, "/2fa") == 0) {
+    handle_2fa(connfd, buffer);
+  } else if (strcmp(method, "GET") == 0 && strcmp(path, "/events") == 0) {
+    handle_events(connfd);
+    return; // Don't close connection for SSE
+  } else {
+    send_json_response(connfd, 404, "{\"error\":\"not found\"}");
   }
-
-  // Format JSON response body
-  size_t json_size = 1024;
-  char *json_body = (char *)malloc(json_size);
-  if (json_body == NULL) {
-    fprintf(stderr, "[.] failed to allocate memory for account response\n");
-    const char *error_response =
-        "HTTP/1.1 500 Internal Server Error\r\nContent-Type: "
-        "application/json\r\nContent-Length: 0\r\n\r\n";
-    writefull(connfd, (void *)error_response, strlen(error_response));
-    return;
-  }
-
-  snprintf(
-      json_body, json_size,
-      "{\"storefront_id\":\"%s\",\"dev_token\":\"%s\",\"music_token\":\"%s\"}",
-      g_storefront_id, g_dev_token, g_music_token);
-
-  int json_len = strlen(json_body);
-
-  // Format HTTP response with headers
-  size_t response_size = 512;
-  char *http_response = (char *)malloc(response_size);
-  if (http_response == NULL) {
-    fprintf(stderr, "[.] failed to allocate memory for HTTP response\n");
-    free(json_body);
-    const char *error_response =
-        "HTTP/1.1 500 Internal Server Error\r\nContent-Type: "
-        "application/json\r\nContent-Length: 0\r\n\r\n";
-    writefull(connfd, (void *)error_response, strlen(error_response));
-    return;
-  }
-
-  snprintf(
-      http_response, response_size,
-      "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
-      "%d\r\nConnection: close\r\n\r\n",
-      json_len);
-
-  fprintf(stderr, "[.] returning account info, storefront: %s\n",
-          g_storefront_id);
-  writefull(connfd, http_response, strlen(http_response));
-  writefull(connfd, json_body, json_len);
-
-  free(http_response);
-  free(json_body);
 }
 
 // Worker thread for handling account connections
@@ -1054,10 +1428,10 @@ char *get_music_user_token(char *guid, char *authToken,
     return "";
   }
 
-  snprintf(
-      body, body_size,
-      "{\"guid\":\"%s\",\"assertion\":\"%s\",\"tcc-acceptance-date\":\"%lld\"}",
-      guid, authToken, getCurrentTimeMillis());
+  snprintf(body, body_size,
+           "{\"guid\":\"%s\",\"assertion\":\"%s\",\"tcc-acceptance-date\":\"%"
+           "lld\"}",
+           guid, authToken, getCurrentTimeMillis());
 
   _ZN13mediaplatform11HTTPMessage11setBodyDataEPcm(httpMessage.obj, body,
                                                    strlen(body));
@@ -1191,35 +1565,62 @@ int main(int argc, char *argv[]) {
 
   init();
   reqCtx = init_ctx();
-  if (args_info.login_given) {
-    amUsername = strtok(args_info.login_arg, ":");
-    amPassword = strtok(NULL, ":");
+
+  // Check for saved credentials to determine initial login status
+  char storefront_path[512], music_token_path[512];
+  snprintf(storefront_path, sizeof(storefront_path), "%s/STOREFRONT_ID",
+           args_info.base_dir_arg);
+  snprintf(music_token_path, sizeof(music_token_path), "%s/MUSIC_TOKEN",
+           args_info.base_dir_arg);
+
+  if (file_exists(storefront_path) && file_exists(music_token_path)) {
+    // Load saved credentials
+    fprintf(stderr, "[+] Found saved credentials, loading...\n");
+
+    // Read storefront ID
+    FILE *fp = fopen(storefront_path, "r");
+    if (fp) {
+      char buf[64] = {0};
+      fgets(buf, sizeof(buf), fp);
+      fclose(fp);
+      g_storefront_id = strdup(buf);
+    }
+
+    // Read music token
+    fp = fopen(music_token_path, "r");
+    if (fp) {
+      char buf[512] = {0};
+      fgets(buf, sizeof(buf), fp);
+      fclose(fp);
+      g_music_token = strdup(buf);
+    }
+
+    // Try to get dev token
+    g_dev_token = get_dev_token(reqCtx);
+
+    // Initialize services
+    _ZN22SVPlaybackLeaseManagerC2ERKNSt6__ndk18functionIFvRKiEEERKNS1_IFvRKNS0_10shared_ptrIN17storeservicescore19StoreErrorConditionEEEEEE(
+        leaseMgr, &endLeaseCallback, &pbErrCallback);
+    uint8_t autom = 1;
+    _ZN22SVPlaybackLeaseManager25refreshLeaseAutomaticallyERKb(leaseMgr,
+                                                               &autom);
+    _ZN22SVPlaybackLeaseManager12requestLeaseERKb(leaseMgr, &autom);
+    FHinstance = _ZN21SVFootHillSessionCtrl8instanceEv();
+
+    offlineFlag = offline_available();
+    if (offlineFlag) {
+      printf("[+] This account supports offline channel\n");
+    }
+
+    g_login_status = STATUS_LOGGED_IN;
+    fprintf(stderr, "[+] Logged in with saved credentials\n");
+  } else {
+    // No saved credentials, wait for API login
+    g_login_status = STATUS_NEED_LOGIN;
+    fprintf(stderr, "[!] No saved credentials, waiting for login via API\n");
   }
-  if (args_info.login_given && !login(reqCtx)) {
-    fprintf(stderr, "[!] login failed\n");
-    return EXIT_FAILURE;
-  }
-  _ZN22SVPlaybackLeaseManagerC2ERKNSt6__ndk18functionIFvRKiEEERKNS1_IFvRKNS0_10shared_ptrIN17storeservicescore19StoreErrorConditionEEEEEE(
-      leaseMgr, &endLeaseCallback, &pbErrCallback);
-  uint8_t autom = 1;
-  _ZN22SVPlaybackLeaseManager25refreshLeaseAutomaticallyERKb(leaseMgr, &autom);
-  _ZN22SVPlaybackLeaseManager12requestLeaseERKb(leaseMgr, &autom);
-  FHinstance = _ZN21SVFootHillSessionCtrl8instanceEv();
 
-  offlineFlag = offline_available();
-  if (offlineFlag) {
-    printf("[+] This account supports offline channel\n");
-  }
-
-  // Cache account info
-  g_storefront_id = get_account_storefront_id(reqCtx);
-  g_dev_token = get_dev_token(reqCtx);
-  g_music_token = get_music_user_token(get_guid(), g_dev_token, reqCtx);
-  fprintf(stderr, "[+] account info cached successfully\n");
-
-  write_storefront_id();
-  write_music_token();
-
+  // Start service threads
   pthread_t m3u8_thread;
   pthread_create(&m3u8_thread, NULL, &new_socket_m3u8, NULL);
   pthread_detach(m3u8_thread);
