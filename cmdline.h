@@ -54,11 +54,6 @@ struct gengetopt_args_info
   char * proxy_arg;	/**< @brief  (default='').  */
   char * proxy_orig;	/**< @brief  original value given at command line.  */
   const char *proxy_help; /**< @brief  help description.  */
-  char * login_arg;	/**< @brief username:password.  */
-  char * login_orig;	/**< @brief username:password original value given at command line.  */
-  const char *login_help; /**< @brief username:password help description.  */
-  int code_from_file_flag;	/**< @brief  (default=off).  */
-  const char *code_from_file_help; /**< @brief  help description.  */
   char * base_dir_arg;	/**< @brief  (default='/data/data/com.apple.android.music/files').  */
   char * base_dir_orig;	/**< @brief  original value given at command line.  */
   const char *base_dir_help; /**< @brief  help description.  */
@@ -73,8 +68,6 @@ struct gengetopt_args_info
   unsigned int m3u8_port_given ;	/**< @brief Whether m3u8-port was given.  */
   unsigned int account_port_given ;	/**< @brief Whether account-port was given.  */
   unsigned int proxy_given ;	/**< @brief Whether proxy was given.  */
-  unsigned int login_given ;	/**< @brief Whether login was given.  */
-  unsigned int code_from_file_given ;	/**< @brief Whether code-from-file was given.  */
   unsigned int base_dir_given ;	/**< @brief Whether base-dir was given.  */
   unsigned int device_info_given ;	/**< @brief Whether device-info was given.  */
 
