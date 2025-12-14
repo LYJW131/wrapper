@@ -1278,6 +1278,55 @@ static void handle_events(int connfd) {
   fprintf(stderr, "[SSE] client disconnected (fd=%d)\n", connfd);
 }
 
+static void handle_logout(int connfd) {
+  pthread_mutex_lock(&status_mutex);
+  login_status_t status = g_login_status;
+  pthread_mutex_unlock(&status_mutex);
+
+  if (status == STATUS_LOGGING_IN || status == STATUS_NEED_2FA) {
+    send_json_response(connfd, 400, "{\"error\":\"login in progress\"}");
+    return;
+  }
+
+  // Delete saved credential files
+  char storefront_path[512], music_token_path[512];
+  snprintf(storefront_path, sizeof(storefront_path), "%s/STOREFRONT_ID",
+           args_info.base_dir_arg);
+  snprintf(music_token_path, sizeof(music_token_path), "%s/MUSIC_TOKEN",
+           args_info.base_dir_arg);
+
+  if (file_exists(storefront_path)) {
+    remove(storefront_path);
+  }
+  if (file_exists(music_token_path)) {
+    remove(music_token_path);
+  }
+
+  // Clear in-memory credentials
+  if (g_storefront_id) {
+    free(g_storefront_id);
+    g_storefront_id = NULL;
+  }
+  if (g_dev_token) {
+    free(g_dev_token);
+    g_dev_token = NULL;
+  }
+  if (g_music_token) {
+    free(g_music_token);
+    g_music_token = NULL;
+  }
+
+  // Reset login state
+  g_username[0] = '\0';
+  g_password[0] = '\0';
+  g_login_error[0] = '\0';
+
+  set_login_status(STATUS_NEED_LOGIN);
+
+  fprintf(stderr, "[.] /logout: cleared login state\n");
+  send_json_response(connfd, 200, "{\"message\":\"logged out\"}");
+}
+
 // ===== Main Account Handler =====
 
 void handle_account(const int connfd) {
@@ -1300,6 +1349,8 @@ void handle_account(const int connfd) {
     handle_login(connfd, buffer);
   } else if (strcmp(method, "POST") == 0 && strcmp(path, "/2fa") == 0) {
     handle_2fa(connfd, buffer);
+  } else if (strcmp(method, "POST") == 0 && strcmp(path, "/logout") == 0) {
+    handle_logout(connfd);
   } else if (strcmp(method, "GET") == 0 && strcmp(path, "/events") == 0) {
     handle_events(connfd);
     return; // Don't close connection for SSE
