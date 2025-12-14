@@ -95,6 +95,7 @@ The Account API (port 30020) provides login management via HTTP endpoints.
 | `/info` | GET | Get current login status and account info |
 | `/login` | POST | Submit credentials to start login |
 | `/2fa` | POST | Submit 2FA verification code |
+| `/logout` | POST | Clear login state and saved credentials |
 | `/events` | GET | SSE stream for real-time status updates |
 
 ### Login Flow
@@ -120,6 +121,10 @@ curl -X POST http://localhost:30020/2fa \
 # 5. Check account info
 curl http://localhost:30020/info
 # Returns: {"logged_in":true,"storefront_id":"...","dev_token":"...","music_token":"..."}
+
+# 6. Logout (optional)
+curl -X POST http://localhost:30020/logout
+# Returns: {"message":"logged out"}
 ```
 
 ### SSE Events
